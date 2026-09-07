@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from data_validator import RULES_VERSION, __version__
 from data_validator.core.config import ColumnMapping, ValidationConfig
+from data_validator.core.config_parsing import parse_quantity_map
 from data_validator.core.models import ValidationMode, ValidationResult
 from data_validator.core.validation_service import ValidationService
 from data_validator.ingestion.discovery import discover_files, discover_folder
@@ -56,7 +57,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Data Validator {__version__}")
-        self.resize(1000, 760)
+        self.resize(1040, 820)
         self.setAcceptDrops(True)
         self.files: list[Path] = []
         self.result: ValidationResult | None = None
@@ -90,7 +91,7 @@ class MainWindow(QMainWindow):
 
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.file_list.setMinimumHeight(110)
+        self.file_list.setMinimumHeight(100)
         layout.addWidget(self.file_list)
 
         settings = QGroupBox("Validation Settings")
@@ -107,8 +108,11 @@ class MainWindow(QMainWindow):
         self.expected_sku = QLineEdit()
         self.expected_rows = QLineEdit()
         self.expected_batch = QLineEdit()
+        self.expected_sku_quantities = QLineEdit()
+        self.expected_sku_quantities.setPlaceholderText('{"SKU01": 100000, "SKU02": 200000}')
         self.start_serial = QLineEdit()
         self.end_serial = QLineEdit()
+        self.filename_regex = QLineEdit()
         self.one_sku = QCheckBox("Require one SKU per file")
         form.addRow("Mode", self.mode)
         form.addRow("Batch ID", self.batch_id)
@@ -120,8 +124,10 @@ class MainWindow(QMainWindow):
         form.addRow("Expected SKU (optional)", self.expected_sku)
         form.addRow("Expected rows/file (optional)", self.expected_rows)
         form.addRow("Expected batch quantity (optional)", self.expected_batch)
+        form.addRow("Expected SKU quantities JSON (optional)", self.expected_sku_quantities)
         form.addRow("Start Serial (optional)", self.start_serial)
         form.addRow("End Serial (optional)", self.end_serial)
+        form.addRow("Filename regex (optional)", self.filename_regex)
         form.addRow("SKU rule", self.one_sku)
         layout.addWidget(settings)
 
@@ -159,7 +165,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.summary_label)
 
         self.issue_table = QTableWidget(0, 6)
-        self.issue_table.setHorizontalHeaderLabels(["Severity", "Code", "File", "Row", "Serial", "Description"])
+        self.issue_table.setHorizontalHeaderLabels(
+            ["Severity", "Code", "File", "Row", "Serial", "Description"]
+        )
         self.issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.issue_table.setAlternatingRowColors(True)
         layout.addWidget(self.issue_table, 1)
@@ -185,7 +193,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def select_files(self) -> None:
-        names, _ = QFileDialog.getOpenFileNames(self, "Select Data Files", "", "Data files (*.csv *.xlsx)")
+        names, _ = QFileDialog.getOpenFileNames(
+            self, "Select Data Files", "", "Data files (*.csv *.xlsx)"
+        )
         if names:
             self._add_paths([Path(name) for name in names])
 
@@ -231,7 +241,11 @@ class MainWindow(QMainWindow):
         return value
 
     def _config(self) -> ValidationConfig:
-        if not self.sku_column.text().strip() or not self.serial_column.text().strip() or not self.qr_column.text().strip():
+        if (
+            not self.sku_column.text().strip()
+            or not self.serial_column.text().strip()
+            or not self.qr_column.text().strip()
+        ):
             raise ValueError("Column mappings cannot be blank.")
         return ValidationConfig(
             columns=ColumnMapping(
@@ -244,10 +258,18 @@ class MainWindow(QMainWindow):
             serial_regex=self.serial_regex.text().strip() or None,
             serial_numeric_regex=self.serial_numeric_regex.text().strip() or None,
             expected_sku=self.expected_sku.text().strip() or None,
-            expected_rows_per_file=self._int_or_none(self.expected_rows, "Expected rows/file"),
-            expected_batch_quantity=self._int_or_none(self.expected_batch, "Expected batch quantity"),
+            expected_rows_per_file=self._int_or_none(
+                self.expected_rows, "Expected rows/file"
+            ),
+            expected_batch_quantity=self._int_or_none(
+                self.expected_batch, "Expected batch quantity"
+            ),
+            expected_quantity_per_sku=parse_quantity_map(
+                self.expected_sku_quantities.text()
+            ),
             start_serial=self.start_serial.text().strip() or None,
             end_serial=self.end_serial.text().strip() or None,
+            filename_regex=self.filename_regex.text().strip() or None,
             one_sku_per_file=self.one_sku.isChecked(),
         )
 
@@ -308,7 +330,7 @@ class MainWindow(QMainWindow):
         conflicts = counts.get("SERIAL_QR_CONFLICT", 0) + counts.get("QR_SERIAL_CONFLICT", 0)
         self.summary_label.setText(
             f"Files: {result.file_count:,}   Records: {result.record_count:,}   "
-            f"Failures: {result.failure_count:,}   Warnings: {result.warning_count:,}\n"
+            f"Issue details: {len(result.issues):,}   Warnings shown: {result.warning_count:,}\n"
             f"Duplicate Serial: {serial_dup:,}   Duplicate QR: {qr_dup:,}   Pair conflicts: {conflicts:,}"
         )
         preview = result.issues[:1000]
@@ -351,6 +373,14 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Report Folder")
         if not folder:
             return
-        output = Path(folder) / (f"Validation_{self.result.batch_id}" if self.result.batch_id else "Validation_Report")
+        output = Path(folder) / (
+            f"Validation_{self.result.batch_id}"
+            if self.result.batch_id
+            else "Validation_Report"
+        )
         reports = export_reports(self.result, output)
-        QMessageBox.information(self, "Reports exported", f"Reports saved to:\n{reports.summary_text.parent}")
+        QMessageBox.information(
+            self,
+            "Reports exported",
+            f"Reports saved to:\n{reports.summary_text.parent}",
+        )
