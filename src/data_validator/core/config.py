@@ -36,10 +36,12 @@ class ValidationConfig:
     expected_quantity_per_sku: dict[str, int] = field(default_factory=dict)
     start_serial: str | None = None
     end_serial: str | None = None
+    filename_regex: str | None = None
 
     gap_severity: Severity = Severity.WARNING
     out_of_order_severity: Severity = Severity.WARNING
     qr_whitespace_severity: Severity = Severity.WARNING
+    filename_severity: Severity = Severity.WARNING
 
     memory_limit_mb: int | None = None
     threads: int | None = None
@@ -48,6 +50,6 @@ class ValidationConfig:
     csv_delimiter: str | None = None
     xlsx_sheet: str | None = None
 
-    max_issue_details: int = 100_000
-    max_gap_details: int = 10_000
+    max_issue_details: int = 5_000
+    max_gap_details: int = 5_000
     xlsx_batch_size: int = 20_000
