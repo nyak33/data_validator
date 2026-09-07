@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from pathlib import Path
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterable
+from pathlib import Path
 
 from data_validator.core.config import ValidationConfig
-from data_validator.core.models import FileSummary, Severity, ValidationIssue, ValidationMode, ValidationResult
+from data_validator.core.models import (
+    FileSummary,
+    Severity,
+    ValidationIssue,
+    ValidationMode,
+    ValidationResult,
+)
 from data_validator.core.normalisation import extract_running_number, normalise_serial
 from data_validator.ingestion.database import ValidationDatabase
 from data_validator.ingestion.discovery import discover_files, discover_folder
@@ -31,7 +37,12 @@ class ValidationService:
         if self._db is not None:
             self._db.interrupt()
 
-    def validate(self, inputs: Iterable[Path | str], config: ValidationConfig | None = None, progress: ProgressCallback | None = None) -> ValidationResult:
+    def validate(
+        self,
+        inputs: Iterable[Path | str],
+        config: ValidationConfig | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> ValidationResult:
         config = config or ValidationConfig()
         self._cancel.clear()
         result = ValidationResult(batch_id=config.batch_id, mode=config.mode)
@@ -43,10 +54,23 @@ class ValidationService:
             result.metrics["ignored_files"] = [str(p) for p in ignored]
             if not files:
                 result.incomplete = True
-                result.add_issue(ValidationIssue("NO_SUPPORTED_FILES", Severity.FAIL, "No supported CSV/XLSX files were selected."))
+                result.add_issue(
+                    ValidationIssue(
+                        "NO_SUPPORTED_FILES",
+                        Severity.FAIL,
+                        "No supported CSV/XLSX files were selected.",
+                    )
+                )
                 return result
 
-            self._emit(progress, "Inspecting files", files_processed=0, total_files=len(files), records_processed=0)
+            self._filename_rules(files, config, result)
+            self._emit(
+                progress,
+                "Inspecting files",
+                files_processed=0,
+                total_files=len(files),
+                records_processed=0,
+            )
             inspections = self._inspect_and_validate_structure(files, config, result, progress)
             if not inspections:
                 if result.failure_count:
@@ -66,11 +90,16 @@ class ValidationService:
             result.metrics["estimated_temp_bytes"] = estimated_temp
             if plan.free_temp_bytes < estimated_temp:
                 result.incomplete = True
-                result.add_issue(ValidationIssue(
-                    "INSUFFICIENT_TEMP_DISK",
-                    Severity.FAIL,
-                    f"Insufficient temporary disk space. Estimated {estimated_temp:,} bytes required, {plan.free_temp_bytes:,} available.",
-                ))
+                result.add_issue(
+                    ValidationIssue(
+                        "INSUFFICIENT_TEMP_DISK",
+                        Severity.FAIL,
+                        (
+                            f"Insufficient temporary disk space. Estimated {estimated_temp:,} "
+                            f"bytes required, {plan.free_temp_bytes:,} available."
+                        ),
+                    )
+                )
                 return result
 
             db = ValidationDatabase(plan, config)
@@ -78,11 +107,28 @@ class ValidationService:
             records = 0
             for idx, info in enumerate(inspections, start=1):
                 self._check_cancel()
-                self._emit(progress, "Importing data", files_processed=idx - 1, total_files=len(inspections), current_file=str(info.path), records_processed=records)
+                self._emit(
+                    progress,
+                    "Importing data",
+                    files_processed=idx - 1,
+                    total_files=len(inspections),
+                    current_file=str(info.path),
+                    records_processed=records,
+                )
+                self._check_cancel()
                 summary = db.ingest(idx, info)
                 records += summary.rows
-                result.file_summaries.append(FileSummary(path=info.path, rows=summary.rows, file_id=idx))
-                self._emit(progress, "Importing data", files_processed=idx, total_files=len(inspections), current_file=str(info.path), records_processed=records)
+                result.file_summaries.append(
+                    FileSummary(path=info.path, rows=summary.rows, file_id=idx)
+                )
+                self._emit(
+                    progress,
+                    "Importing data",
+                    files_processed=idx,
+                    total_files=len(inspections),
+                    current_file=str(info.path),
+                    records_processed=records,
+                )
 
             result.record_count = records
             db.populate_serial_numbers()
@@ -91,12 +137,18 @@ class ValidationService:
         except ValidationCancelled:
             result.cancelled = True
             return result
-        except Exception as exc:
+        except Exception as exc:  # Boundary: unexpected errors must fail safely, never PASS.
             if self._cancel.is_set():
                 result.cancelled = True
             else:
                 result.incomplete = True
-                result.add_issue(ValidationIssue("INTERNAL_ERROR", Severity.FAIL, f"Validation could not complete: {type(exc).__name__}: {exc}"))
+                result.add_issue(
+                    ValidationIssue(
+                        "INTERNAL_ERROR",
+                        Severity.FAIL,
+                        f"Validation could not complete: {type(exc).__name__}: {exc}",
+                    )
+                )
             return result
         finally:
             result.metrics["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -104,44 +156,113 @@ class ValidationService:
                 db.close(cleanup=True)
             self._db = None
 
-    def _resolve_inputs(self, inputs: Iterable[Path | str]) -> tuple[list[Path], list[Path]]:
+    def _resolve_inputs(
+        self, inputs: Iterable[Path | str]
+    ) -> tuple[list[Path], list[Path]]:
         files: list[Path] = []
         ignored: list[Path] = []
         for item in inputs:
-            p = Path(item).resolve()
-            if p.is_dir():
-                found = discover_folder(p, recursive=False)
+            path = Path(item).resolve()
+            if path.is_dir():
+                found = discover_folder(path, recursive=False)
             else:
-                found = discover_files([p])
+                found = discover_files([path])
             files.extend(found.supported)
             ignored.extend(found.ignored)
+
         unique: dict[Path, None] = {}
-        for p in files:
-            unique[p] = None
+        for path in files:
+            unique[path] = None
         return list(unique), ignored
 
-    def _inspect_and_validate_structure(self, files: list[Path], config: ValidationConfig, result: ValidationResult, progress: ProgressCallback | None) -> list[FileInspection]:
+    def _filename_rules(
+        self,
+        files: list[Path],
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
+        if not config.filename_regex:
+            return
+        import re
+
+        bad = [path for path in files if re.fullmatch(config.filename_regex, path.name) is None]
+        self._record_rule_count(result, "FILENAME_CONVENTION", len(bad))
+        for path in bad[: config.max_issue_details]:
+            result.add_issue(
+                ValidationIssue(
+                    "FILENAME_CONVENTION",
+                    config.filename_severity,
+                    "Filename does not match the configured convention.",
+                    source_file=str(path),
+                )
+            )
+
+    def _inspect_and_validate_structure(
+        self,
+        files: list[Path],
+        config: ValidationConfig,
+        result: ValidationResult,
+        progress: ProgressCallback | None,
+    ) -> list[FileInspection]:
         good: list[FileInspection] = []
         required = {config.columns.sku, config.columns.serial, config.columns.qr}
         for idx, path in enumerate(files, start=1):
             self._check_cancel()
-            info = inspect_file(path, encoding=config.csv_encoding, delimiter=config.csv_delimiter)
+            info = inspect_file(
+                path,
+                encoding=config.csv_encoding,
+                delimiter=config.csv_delimiter,
+            )
             if info.error:
                 result.incomplete = True
-                result.add_issue(ValidationIssue("CORRUPT_FILE", Severity.FAIL, info.error, source_file=str(path)))
+                result.add_issue(
+                    ValidationIssue(
+                        "CORRUPT_FILE",
+                        Severity.FAIL,
+                        info.error,
+                        source_file=str(path),
+                    )
+                )
             elif not info.has_data:
-                result.add_issue(ValidationIssue("EMPTY_FILE", Severity.FAIL, "Selected file contains no data rows.", source_file=str(path)))
+                result.add_issue(
+                    ValidationIssue(
+                        "EMPTY_FILE",
+                        Severity.FAIL,
+                        "Selected file contains no data rows.",
+                        source_file=str(path),
+                    )
+                )
             else:
                 missing = sorted(required.difference(info.headers))
                 if missing:
                     result.incomplete = True
-                    result.add_issue(ValidationIssue("REQUIRED_COLUMN_MISSING", Severity.FAIL, "Missing required column(s): " + ", ".join(missing), source_file=str(path)))
+                    result.add_issue(
+                        ValidationIssue(
+                            "REQUIRED_COLUMN_MISSING",
+                            Severity.FAIL,
+                            "Missing required column(s): " + ", ".join(missing),
+                            source_file=str(path),
+                        )
+                    )
                 else:
                     good.append(info)
-            self._emit(progress, "Inspecting files", files_processed=idx, total_files=len(files), current_file=str(path), records_processed=0)
+            self._emit(
+                progress,
+                "Inspecting files",
+                files_processed=idx,
+                total_files=len(files),
+                current_file=str(path),
+                records_processed=0,
+            )
         return good
 
-    def _run_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult, progress: ProgressCallback | None) -> None:
+    def _run_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+        progress: ProgressCallback | None,
+    ) -> None:
         rules: list[tuple[str, Callable[[], None]]] = [
             ("Checking required values", lambda: self._required_rules(db, config, result)),
             ("Checking Serial format", lambda: self._serial_format_rules(db, config, result)),
@@ -151,20 +272,57 @@ class ValidationService:
             ("Checking duplicates", lambda: self._duplicate_rules(db, config, result)),
         ]
         if config.mode is ValidationMode.FULL:
-            rules.extend([
-                ("Checking Serial range", lambda: self._range_rules(db, config, result)),
-                ("Checking Serial sequence", lambda: self._sequence_rules(db, config, result)),
-            ])
+            rules.extend(
+                [
+                    ("Checking Serial range", lambda: self._range_rules(db, config, result)),
+                    (
+                        "Checking Serial sequence",
+                        lambda: self._sequence_rules(db, config, result),
+                    ),
+                ]
+            )
         for stage, func in rules:
             self._check_cancel()
-            self._emit(progress, stage, records_processed=result.record_count, files_processed=result.file_count, total_files=result.file_count)
+            self._emit(
+                progress,
+                stage,
+                records_processed=result.record_count,
+                files_processed=result.file_count,
+                total_files=result.file_count,
+            )
             func()
 
-    def _required_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
-        self._emit_row_rule(db, result, "MISSING_SERIAL", Severity.FAIL, "serial = ''", "Serial Number is missing.", config)
-        self._emit_row_rule(db, result, "MISSING_QR", Severity.FAIL, "qr = ''", "QR Data is missing.", config)
+    def _required_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
+        self._emit_row_rule(
+            db,
+            result,
+            "MISSING_SERIAL",
+            Severity.FAIL,
+            "serial = ''",
+            "Serial Number is missing.",
+            config,
+        )
+        self._emit_row_rule(
+            db,
+            result,
+            "MISSING_QR",
+            Severity.FAIL,
+            "qr = ''",
+            "QR Data is missing.",
+            config,
+        )
 
-    def _serial_format_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+    def _serial_format_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         conditions: list[str] = []
         params: list[object] = []
         if config.serial_regex:
@@ -172,7 +330,11 @@ class ValidationService:
             params.append(config.serial_regex)
         if config.serial_prefix:
             conditions.append("NOT starts_with(serial, ?)")
-            params.append(config.serial_prefix if config.serial_case_sensitive else config.serial_prefix.upper())
+            params.append(
+                config.serial_prefix
+                if config.serial_case_sensitive
+                else config.serial_prefix.upper()
+            )
         if config.serial_total_length is not None:
             conditions.append("length(serial) <> ?")
             params.append(config.serial_total_length)
@@ -180,90 +342,373 @@ class ValidationService:
             conditions.append("serial_num IS NULL")
         if not conditions:
             return
+
         where = "serial <> '' AND (" + " OR ".join(conditions) + ")"
-        self._emit_row_rule(db, result, "INVALID_SERIAL_FORMAT", Severity.FAIL, where, "Serial Number does not match configured format.", config, params)
+        self._emit_row_rule(
+            db,
+            result,
+            "INVALID_SERIAL_FORMAT",
+            Severity.FAIL,
+            where,
+            "Serial Number does not match configured format.",
+            config,
+            params,
+        )
         if config.serial_regex:
             suspicious_where = where + " AND regexp_matches(serial, '[OIl]')"
-            self._emit_row_rule(db, result, "SUSPICIOUS_SERIAL_CHARACTER", Severity.WARNING, suspicious_where, "Serial contains a potentially ambiguous character.", config, params)
+            self._emit_row_rule(
+                db,
+                result,
+                "SUSPICIOUS_SERIAL_CHARACTER",
+                Severity.WARNING,
+                suspicious_where,
+                "Serial contains a potentially ambiguous character.",
+                config,
+                params,
+            )
 
-    def _qr_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
-        self._emit_row_rule(db, result, "QR_SURROUNDING_WHITESPACE", config.qr_whitespace_severity, "qr_raw IS NOT NULL AND qr_raw <> trim(qr_raw)", "QR Data has leading or trailing whitespace.", config)
-        self._emit_row_rule(db, result, "QR_CONTROL_CHARACTER", Severity.FAIL, "qr_raw IS NOT NULL AND regexp_matches(qr_raw, '[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]')", "QR Data contains a control character.", config)
-        self._emit_row_rule(db, result, "QR_LINEBREAK", Severity.FAIL, "qr_raw IS NOT NULL AND (contains(qr_raw, chr(10)) OR contains(qr_raw, chr(13)))", "QR Data contains a line break.", config)
+    def _qr_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
+        self._emit_row_rule(
+            db,
+            result,
+            "QR_SURROUNDING_WHITESPACE",
+            config.qr_whitespace_severity,
+            "qr_raw IS NOT NULL AND qr_raw <> trim(qr_raw)",
+            "QR Data has leading or trailing whitespace.",
+            config,
+        )
+        self._emit_row_rule(
+            db,
+            result,
+            "QR_CONTROL_CHARACTER",
+            Severity.FAIL,
+            (
+                "qr_raw IS NOT NULL AND "
+                "regexp_matches(qr_raw, '[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]')"
+            ),
+            "QR Data contains a control character.",
+            config,
+        )
+        self._emit_row_rule(
+            db,
+            result,
+            "QR_LINEBREAK",
+            Severity.FAIL,
+            (
+                "qr_raw IS NOT NULL AND "
+                "(contains(qr_raw, chr(10)) OR contains(qr_raw, chr(13)))"
+            ),
+            "QR Data contains a line break.",
+            config,
+        )
 
-    def _sku_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+    def _sku_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         if config.expected_sku is not None:
-            self._emit_row_rule(db, result, "UNEXPECTED_SKU", Severity.FAIL, "sku <> ?", "Row contains an unexpected SKU.", config, [config.expected_sku])
-        if config.one_sku_per_file:
-            groups = db.conn.execute("SELECT file_id, min(source_file), count(DISTINCT sku) FROM records GROUP BY file_id HAVING count(DISTINCT sku) > 1").fetchall()
-            for _, source_file, count in groups[: config.max_issue_details]:
-                result.add_issue(ValidationIssue("MIXED_SKU", Severity.FAIL, f"File contains {count} different SKU values.", source_file=source_file))
-            self._record_rule_count(result, "MIXED_SKU", len(groups))
+            self._emit_row_rule(
+                db,
+                result,
+                "UNEXPECTED_SKU",
+                Severity.FAIL,
+                "sku <> ?",
+                "Row contains an unexpected SKU.",
+                config,
+                [config.expected_sku],
+            )
 
-    def _quantity_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+        if config.one_sku_per_file:
+            query = """
+                SELECT file_id, min(source_file) AS source_file, count(DISTINCT sku) AS sku_count
+                FROM records
+                GROUP BY file_id
+                HAVING count(DISTINCT sku) > 1
+            """
+            count = self._count_subquery(db, query)
+            self._record_rule_count(result, "MIXED_SKU", count)
+            rows = db.conn.execute(
+                query + " ORDER BY file_id LIMIT ?", [config.max_issue_details]
+            ).fetchall()
+            for _, source_file, sku_count in rows:
+                result.add_issue(
+                    ValidationIssue(
+                        "MIXED_SKU",
+                        Severity.FAIL,
+                        f"File contains {int(sku_count)} different SKU values.",
+                        source_file=source_file,
+                    )
+                )
+
+    def _quantity_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         if config.expected_rows_per_file is not None:
-            rows = db.conn.execute("SELECT file_id, min(source_file), count(*) FROM records GROUP BY file_id").fetchall()
-            mismatches = [(fid, path, count) for fid, path, count in rows if int(count) != config.expected_rows_per_file]
-            for _, path, count in mismatches[: config.max_issue_details]:
-                result.add_issue(ValidationIssue("RECORD_COUNT_MISMATCH", Severity.FAIL, f"Expected {config.expected_rows_per_file:,} rows, found {int(count):,}.", source_file=path))
-            self._record_rule_count(result, "RECORD_COUNT_MISMATCH", len(mismatches))
-        if config.mode is ValidationMode.FULL and config.expected_batch_quantity is not None and result.record_count != config.expected_batch_quantity:
-            result.add_issue(ValidationIssue("BATCH_QUANTITY_MISMATCH", Severity.FAIL, f"Expected batch quantity {config.expected_batch_quantity:,}, found {result.record_count:,}."))
+            query = """
+                SELECT file_id, min(source_file) AS source_file, count(*) AS row_count
+                FROM records
+                GROUP BY file_id
+                HAVING count(*) <> ?
+            """
+            count = int(
+                db.conn.execute(
+                    f"SELECT count(*) FROM ({query}) q",
+                    [config.expected_rows_per_file],
+                ).fetchone()[0]
+            )
+            self._record_rule_count(result, "RECORD_COUNT_MISMATCH", count)
+            rows = db.conn.execute(
+                query + " ORDER BY file_id LIMIT ?",
+                [config.expected_rows_per_file, config.max_issue_details],
+            ).fetchall()
+            for _, path, row_count in rows:
+                result.add_issue(
+                    ValidationIssue(
+                        "RECORD_COUNT_MISMATCH",
+                        Severity.FAIL,
+                        (
+                            f"Expected {config.expected_rows_per_file:,} rows, "
+                            f"found {int(row_count):,}."
+                        ),
+                        source_file=path,
+                    )
+                )
+
+        if (
+            config.mode is ValidationMode.FULL
+            and config.expected_batch_quantity is not None
+            and result.record_count != config.expected_batch_quantity
+        ):
+            result.add_issue(
+                ValidationIssue(
+                    "BATCH_QUANTITY_MISMATCH",
+                    Severity.FAIL,
+                    (
+                        f"Expected batch quantity {config.expected_batch_quantity:,}, "
+                        f"found {result.record_count:,}."
+                    ),
+                )
+            )
             self._record_rule_count(result, "BATCH_QUANTITY_MISMATCH", 1)
 
-    def _duplicate_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+        if config.mode is ValidationMode.FULL and config.expected_quantity_per_sku:
+            actual = {
+                str(sku): int(count)
+                for sku, count in db.conn.execute(
+                    "SELECT sku, count(*) FROM records GROUP BY sku"
+                ).fetchall()
+            }
+            mismatches: list[tuple[str, int, int]] = []
+            for sku, expected in config.expected_quantity_per_sku.items():
+                found = actual.get(sku, 0)
+                if found != expected:
+                    mismatches.append((sku, expected, found))
+            self._record_rule_count(result, "SKU_QUANTITY_MISMATCH", len(mismatches))
+            for sku, expected, found in mismatches[: config.max_issue_details]:
+                result.add_issue(
+                    ValidationIssue(
+                        "SKU_QUANTITY_MISMATCH",
+                        Severity.FAIL,
+                        f"Expected {expected:,} records for SKU {sku}, found {found:,}.",
+                        sku=sku,
+                    )
+                )
+
+    def _duplicate_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         group_select = "file_id, " if config.mode is ValidationMode.QUICK else ""
         group_by = "file_id, " if config.mode is ValidationMode.QUICK else ""
-        exact = db.conn.execute(f"SELECT {group_select} serial, qr, count(*) FROM records WHERE serial <> '' AND qr <> '' GROUP BY {group_by} serial, qr HAVING count(*) > 1 ORDER BY serial, qr").fetchall()
-        for row in exact[: config.max_issue_details]:
+
+        exact_query = f"""
+            SELECT {group_select} serial, qr, count(*) AS occurrence_count
+            FROM records
+            WHERE serial <> '' AND qr <> ''
+            GROUP BY {group_by} serial, qr
+            HAVING count(*) > 1
+        """
+        exact_count = self._count_subquery(db, exact_query)
+        self._record_rule_count(result, "DUPLICATE_RECORD", exact_count)
+        exact_rows = db.conn.execute(
+            exact_query + " ORDER BY serial, qr LIMIT ?", [config.max_issue_details]
+        ).fetchall()
+        for row in exact_rows:
             if config.mode is ValidationMode.QUICK:
-                file_id, serial, qr, n = row
+                file_id, serial, qr, occurrence_count = row
             else:
                 file_id = None
-                serial, qr, n = row
-            first, second = self._first_two(db, serial=serial, qr=qr, file_id=file_id)
-            result.add_issue(self._group_issue("DUPLICATE_RECORD", "The same Serial/QR pair appears more than once.", serial, qr, first, second, n))
-        self._record_rule_count(result, "DUPLICATE_RECORD", len(exact))
+                serial, qr, occurrence_count = row
+            first, second = self._first_two(
+                db,
+                serial=serial,
+                qr=qr,
+                file_id=file_id,
+            )
+            result.add_issue(
+                self._group_issue(
+                    "DUPLICATE_RECORD",
+                    "The same Serial/QR pair appears more than once.",
+                    serial,
+                    qr,
+                    first,
+                    second,
+                    occurrence_count,
+                )
+            )
 
-        serial_groups = db.conn.execute(f"SELECT {group_select} serial, count(DISTINCT qr) FROM records WHERE serial <> '' AND qr <> '' GROUP BY {group_by} serial HAVING count(DISTINCT qr) > 1 ORDER BY serial").fetchall()
-        for row in serial_groups[: config.max_issue_details]:
+        serial_query = f"""
+            SELECT {group_select} serial, count(DISTINCT qr) AS distinct_qr
+            FROM records
+            WHERE serial <> '' AND qr <> ''
+            GROUP BY {group_by} serial
+            HAVING count(DISTINCT qr) > 1
+        """
+        serial_count = self._count_subquery(db, serial_query)
+        self._record_rule_count(result, "DUPLICATE_SERIAL", serial_count)
+        self._record_rule_count(result, "SERIAL_QR_CONFLICT", serial_count)
+        serial_rows = db.conn.execute(
+            serial_query + " ORDER BY serial LIMIT ?", [config.max_issue_details]
+        ).fetchall()
+        for row in serial_rows:
             if config.mode is ValidationMode.QUICK:
                 file_id, serial, distinct_qr = row
             else:
                 file_id = None
                 serial, distinct_qr = row
-            first, second = self._first_two(db, serial=serial, file_id=file_id, distinct_qr=True)
-            for code, message in (("DUPLICATE_SERIAL", "Serial Number is associated with multiple QR values."), ("SERIAL_QR_CONFLICT", "One Serial maps to more than one QR value.")):
-                result.add_issue(self._group_issue(code, message, serial, None, first, second, distinct_qr))
-        self._record_rule_count(result, "DUPLICATE_SERIAL", len(serial_groups))
-        self._record_rule_count(result, "SERIAL_QR_CONFLICT", len(serial_groups))
+            first, second = self._first_two(
+                db,
+                serial=serial,
+                file_id=file_id,
+                distinct_qr=True,
+            )
+            for code, message in (
+                (
+                    "DUPLICATE_SERIAL",
+                    "Serial Number is associated with multiple QR values.",
+                ),
+                (
+                    "SERIAL_QR_CONFLICT",
+                    "One Serial maps to more than one QR value.",
+                ),
+            ):
+                result.add_issue(
+                    self._group_issue(
+                        code,
+                        message,
+                        serial,
+                        None,
+                        first,
+                        second,
+                        distinct_qr,
+                    )
+                )
 
-        qr_groups = db.conn.execute(f"SELECT {group_select} qr, count(DISTINCT serial) FROM records WHERE serial <> '' AND qr <> '' GROUP BY {group_by} qr HAVING count(DISTINCT serial) > 1 ORDER BY qr").fetchall()
-        for row in qr_groups[: config.max_issue_details]:
+        qr_query = f"""
+            SELECT {group_select} qr, count(DISTINCT serial) AS distinct_serial
+            FROM records
+            WHERE serial <> '' AND qr <> ''
+            GROUP BY {group_by} qr
+            HAVING count(DISTINCT serial) > 1
+        """
+        qr_count = self._count_subquery(db, qr_query)
+        self._record_rule_count(result, "DUPLICATE_QR", qr_count)
+        self._record_rule_count(result, "QR_SERIAL_CONFLICT", qr_count)
+        qr_rows = db.conn.execute(
+            qr_query + " ORDER BY qr LIMIT ?", [config.max_issue_details]
+        ).fetchall()
+        for row in qr_rows:
             if config.mode is ValidationMode.QUICK:
                 file_id, qr, distinct_serial = row
             else:
                 file_id = None
                 qr, distinct_serial = row
-            first, second = self._first_two(db, qr=qr, file_id=file_id, distinct_serial=True)
-            for code, message in (("DUPLICATE_QR", "QR Data is associated with multiple Serial Numbers."), ("QR_SERIAL_CONFLICT", "One QR value maps to more than one Serial Number.")):
-                result.add_issue(self._group_issue(code, message, None, qr, first, second, distinct_serial))
-        self._record_rule_count(result, "DUPLICATE_QR", len(qr_groups))
-        self._record_rule_count(result, "QR_SERIAL_CONFLICT", len(qr_groups))
+            first, second = self._first_two(
+                db,
+                qr=qr,
+                file_id=file_id,
+                distinct_serial=True,
+            )
+            for code, message in (
+                (
+                    "DUPLICATE_QR",
+                    "QR Data is associated with multiple Serial Numbers.",
+                ),
+                (
+                    "QR_SERIAL_CONFLICT",
+                    "One QR value maps to more than one Serial Number.",
+                ),
+            ):
+                result.add_issue(
+                    self._group_issue(
+                        code,
+                        message,
+                        None,
+                        qr,
+                        first,
+                        second,
+                        distinct_serial,
+                    )
+                )
 
-    def _range_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+    def _range_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         if not config.start_serial and not config.end_serial:
             return
         if not config.serial_numeric_regex:
             result.incomplete = True
-            result.add_issue(ValidationIssue("INVALID_CONFIGURATION", Severity.FAIL, "Serial range requires serial_numeric_regex."))
+            result.add_issue(
+                ValidationIssue(
+                    "INVALID_CONFIGURATION",
+                    Severity.FAIL,
+                    "Serial range requires serial_numeric_regex.",
+                )
+            )
             return
-        low = extract_running_number(normalise_serial(config.start_serial or "", config), config) if config.start_serial else None
-        high = extract_running_number(normalise_serial(config.end_serial or "", config), config) if config.end_serial else None
-        if (config.start_serial and low is None) or (config.end_serial and high is None):
+
+        low = (
+            extract_running_number(
+                normalise_serial(config.start_serial or "", config), config
+            )
+            if config.start_serial
+            else None
+        )
+        high = (
+            extract_running_number(
+                normalise_serial(config.end_serial or "", config), config
+            )
+            if config.end_serial
+            else None
+        )
+        if (config.start_serial and low is None) or (
+            config.end_serial and high is None
+        ):
             result.incomplete = True
-            result.add_issue(ValidationIssue("INVALID_CONFIGURATION", Severity.FAIL, "Configured Serial range could not be parsed."))
+            result.add_issue(
+                ValidationIssue(
+                    "INVALID_CONFIGURATION",
+                    Severity.FAIL,
+                    "Configured Serial range could not be parsed.",
+                )
+            )
             return
+
         outside: list[str] = []
         params: list[object] = []
         if low is not None:
@@ -273,54 +718,200 @@ class ValidationService:
             outside.append("serial_num > ?")
             params.append(high)
         where = "serial_num IS NOT NULL AND (" + " OR ".join(outside) + ")"
-        self._emit_row_rule(db, result, "SERIAL_OUTSIDE_RANGE", Severity.FAIL, where, "Serial Number is outside the configured range.", config, params)
+        self._emit_row_rule(
+            db,
+            result,
+            "SERIAL_OUTSIDE_RANGE",
+            Severity.FAIL,
+            where,
+            "Serial Number is outside the configured range.",
+            config,
+            params,
+        )
 
-    def _sequence_rules(self, db: ValidationDatabase, config: ValidationConfig, result: ValidationResult) -> None:
+    def _sequence_rules(
+        self,
+        db: ValidationDatabase,
+        config: ValidationConfig,
+        result: ValidationResult,
+    ) -> None:
         if not config.serial_numeric_regex:
             return
-        gaps = db.conn.execute("""
+
+        gap_base = """
             WITH distinct_values AS (
-                SELECT DISTINCT regexp_replace(serial, ?, '') AS seq_key, serial_num
-                FROM records WHERE serial_num IS NOT NULL
-            ), ordered AS (
-                SELECT seq_key, serial_num, lead(serial_num) OVER (PARTITION BY seq_key ORDER BY serial_num) AS next_num
+                SELECT DISTINCT
+                    regexp_replace(serial, ?, '') AS seq_key,
+                    serial_num
+                FROM records
+                WHERE serial_num IS NOT NULL
+            ),
+            ordered AS (
+                SELECT
+                    seq_key,
+                    serial_num,
+                    lead(serial_num) OVER (
+                        PARTITION BY seq_key ORDER BY serial_num
+                    ) AS next_num
                 FROM distinct_values
             )
-            SELECT seq_key, serial_num + 1, next_num - 1, next_num - serial_num - 1
-            FROM ordered WHERE next_num > serial_num + 1
-            ORDER BY seq_key, serial_num
-        """, [config.serial_numeric_regex]).fetchall()
-        for seq_key, start, end, count in gaps[: config.max_gap_details]:
-            result.add_issue(ValidationIssue("SERIAL_GAP", config.gap_severity, f"Serial sequence has a gap: {int(start)} to {int(end)} ({int(count):,} missing).", metadata={"sequence_key": seq_key, "missing_start": int(start), "missing_end": int(end), "missing_count": int(count)}))
-        self._record_rule_count(result, "SERIAL_GAP", len(gaps))
-        result.metrics["missing_serial_count"] = int(sum(int(row[3]) for row in gaps))
-
-        ordered = db.conn.execute("""
-            WITH x AS (
-                SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw, serial_num,
-                       lag(serial_num) OVER (PARTITION BY file_id ORDER BY source_row) AS previous_num
-                FROM records WHERE serial_num IS NOT NULL
+            SELECT
+                seq_key,
+                serial_num + 1 AS missing_start,
+                next_num - 1 AS missing_end,
+                next_num - serial_num - 1 AS missing_count
+            FROM ordered
+            WHERE next_num > serial_num + 1
+        """
+        gap_count, missing_total = db.conn.execute(
+            f"""
+            SELECT count(*), COALESCE(sum(missing_count), 0)
+            FROM ({gap_base}) gaps
+            """,
+            [config.serial_numeric_regex],
+        ).fetchone()
+        gap_count = int(gap_count)
+        self._record_rule_count(result, "SERIAL_GAP", gap_count)
+        result.metrics["missing_serial_count"] = int(missing_total)
+        gap_rows = db.conn.execute(
+            gap_base + " ORDER BY seq_key, missing_start LIMIT ?",
+            [config.serial_numeric_regex, config.max_gap_details],
+        ).fetchall()
+        for seq_key, start, end, count in gap_rows:
+            result.add_issue(
+                ValidationIssue(
+                    "SERIAL_GAP",
+                    config.gap_severity,
+                    (
+                        f"Serial sequence has a gap: {int(start)} to {int(end)} "
+                        f"({int(count):,} missing)."
+                    ),
+                    metadata={
+                        "sequence_key": seq_key,
+                        "missing_start": int(start),
+                        "missing_end": int(end),
+                        "missing_count": int(count),
+                    },
+                )
             )
-            SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw, previous_num, serial_num
-            FROM x WHERE previous_num IS NOT NULL AND serial_num < previous_num
-            ORDER BY source_file, source_row
-        """).fetchall()
-        for row in ordered[: config.max_issue_details]:
-            source_file, sheet, source_row, sku, serial, qr, previous, current = row
-            result.add_issue(ValidationIssue("SERIAL_OUT_OF_ORDER", config.out_of_order_severity, f"Serial running number decreased from {int(previous)} to {int(current)}.", source_file=source_file, source_sheet=sheet, source_row=int(source_row), sku=sku, serial=serial, qr=qr))
-        self._record_rule_count(result, "SERIAL_OUT_OF_ORDER", len(ordered))
 
-    def _emit_row_rule(self, db: ValidationDatabase, result: ValidationResult, code: str, severity: Severity, where: str, message: str, config: ValidationConfig, params: list[object] | None = None) -> None:
+        order_base = """
+            WITH x AS (
+                SELECT
+                    source_file,
+                    source_sheet,
+                    source_row,
+                    sku_raw,
+                    serial_raw,
+                    qr_raw,
+                    serial_num,
+                    lag(serial_num) OVER (
+                        PARTITION BY file_id ORDER BY source_row
+                    ) AS previous_num
+                FROM records
+                WHERE serial_num IS NOT NULL
+            )
+            SELECT
+                source_file,
+                source_sheet,
+                source_row,
+                sku_raw,
+                serial_raw,
+                qr_raw,
+                previous_num,
+                serial_num
+            FROM x
+            WHERE previous_num IS NOT NULL AND serial_num < previous_num
+        """
+        order_count = self._count_subquery(db, order_base)
+        self._record_rule_count(result, "SERIAL_OUT_OF_ORDER", order_count)
+        order_rows = db.conn.execute(
+            order_base + " ORDER BY source_file, source_row LIMIT ?",
+            [config.max_issue_details],
+        ).fetchall()
+        for row in order_rows:
+            source_file, sheet, source_row, sku, serial, qr, previous, current = row
+            result.add_issue(
+                ValidationIssue(
+                    "SERIAL_OUT_OF_ORDER",
+                    config.out_of_order_severity,
+                    (
+                        f"Serial running number decreased from "
+                        f"{int(previous)} to {int(current)}."
+                    ),
+                    source_file=source_file,
+                    source_sheet=sheet,
+                    source_row=int(source_row),
+                    sku=sku,
+                    serial=serial,
+                    qr=qr,
+                )
+            )
+
+    def _emit_row_rule(
+        self,
+        db: ValidationDatabase,
+        result: ValidationResult,
+        code: str,
+        severity: Severity,
+        where: str,
+        message: str,
+        config: ValidationConfig,
+        params: list[object] | None = None,
+    ) -> None:
         params = params or []
-        count = int(db.conn.execute(f"SELECT count(*) FROM records WHERE {where}", params).fetchone()[0])
+        count = int(
+            db.conn.execute(
+                f"SELECT count(*) FROM records WHERE {where}", params
+            ).fetchone()[0]
+        )
         self._record_rule_count(result, code, count)
         if not count:
             return
-        rows = db.conn.execute(f"SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw FROM records WHERE {where} ORDER BY file_id, source_row LIMIT {int(config.max_issue_details)}", params).fetchall()
+        rows = db.conn.execute(
+            f"""
+            SELECT
+                source_file,
+                source_sheet,
+                source_row,
+                sku_raw,
+                serial_raw,
+                qr_raw
+            FROM records
+            WHERE {where}
+            ORDER BY file_id, source_row
+            LIMIT {int(config.max_issue_details)}
+            """,
+            params,
+        ).fetchall()
         for source_file, sheet, source_row, sku, serial, qr in rows:
-            result.add_issue(ValidationIssue(code, severity, message, source_file=source_file, source_sheet=sheet, source_row=int(source_row), sku=sku, serial=serial, qr=qr))
+            result.add_issue(
+                ValidationIssue(
+                    code,
+                    severity,
+                    message,
+                    source_file=source_file,
+                    source_sheet=sheet,
+                    source_row=int(source_row),
+                    sku=sku,
+                    serial=serial,
+                    qr=qr,
+                )
+            )
 
-    def _first_two(self, db: ValidationDatabase, *, serial: str | None = None, qr: str | None = None, file_id: int | None = None, distinct_qr: bool = False, distinct_serial: bool = False) -> tuple[tuple | None, tuple | None]:
+    def _count_subquery(self, db: ValidationDatabase, query: str) -> int:
+        return int(db.conn.execute(f"SELECT count(*) FROM ({query}) q").fetchone()[0])
+
+    def _first_two(
+        self,
+        db: ValidationDatabase,
+        *,
+        serial: str | None = None,
+        qr: str | None = None,
+        file_id: int | None = None,
+        distinct_qr: bool = False,
+        distinct_serial: bool = False,
+    ) -> tuple[tuple | None, tuple | None]:
         clauses: list[str] = []
         params: list[object] = []
         if serial is not None:
@@ -333,27 +924,95 @@ class ValidationService:
             clauses.append("file_id = ?")
             params.append(file_id)
         where = " AND ".join(clauses)
-        if distinct_qr:
-            sql = f"SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw FROM (SELECT *, row_number() OVER (PARTITION BY qr ORDER BY file_id, source_row) AS rn FROM records WHERE {where}) WHERE rn = 1 ORDER BY source_file, source_row LIMIT 2"
-        elif distinct_serial:
-            sql = f"SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw FROM (SELECT *, row_number() OVER (PARTITION BY serial ORDER BY file_id, source_row) AS rn FROM records WHERE {where}) WHERE rn = 1 ORDER BY source_file, source_row LIMIT 2"
-        else:
-            sql = f"SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw FROM records WHERE {where} ORDER BY file_id, source_row LIMIT 2"
-        rows = db.conn.execute(sql, params).fetchall()
-        return rows[0] if rows else None, rows[1] if len(rows) > 1 else None
 
-    def _group_issue(self, code: str, message: str, serial: str | None, qr: str | None, first: tuple | None, second: tuple | None, n: int) -> ValidationIssue:
+        if distinct_qr:
+            sql = f"""
+                SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw
+                FROM (
+                    SELECT *,
+                           row_number() OVER (
+                               PARTITION BY qr ORDER BY file_id, source_row
+                           ) AS rn
+                    FROM records
+                    WHERE {where}
+                )
+                WHERE rn = 1
+                ORDER BY source_file, source_row
+                LIMIT 2
+            """
+        elif distinct_serial:
+            sql = f"""
+                SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw
+                FROM (
+                    SELECT *,
+                           row_number() OVER (
+                               PARTITION BY serial ORDER BY file_id, source_row
+                           ) AS rn
+                    FROM records
+                    WHERE {where}
+                )
+                WHERE rn = 1
+                ORDER BY source_file, source_row
+                LIMIT 2
+            """
+        else:
+            sql = f"""
+                SELECT source_file, source_sheet, source_row, sku_raw, serial_raw, qr_raw
+                FROM records
+                WHERE {where}
+                ORDER BY file_id, source_row
+                LIMIT 2
+            """
+        rows = db.conn.execute(sql, params).fetchall()
+        return (
+            rows[0] if rows else None,
+            rows[1] if len(rows) > 1 else None,
+        )
+
+    def _group_issue(
+        self,
+        code: str,
+        message: str,
+        serial: str | None,
+        qr: str | None,
+        first: tuple | None,
+        second: tuple | None,
+        occurrence_count: int,
+    ) -> ValidationIssue:
         first = first or (None, None, None, None, serial, qr)
         second = second or (None, None, None, None, None, None)
-        return ValidationIssue(code, Severity.FAIL, message, source_file=first[0], source_sheet=first[1], source_row=int(first[2]) if first[2] is not None else None, sku=first[3], serial=serial or first[4], qr=qr or first[5], related_file=second[0], related_row=int(second[2]) if second[2] is not None else None, metadata={"occurrence_count": int(n)})
+        return ValidationIssue(
+            code,
+            Severity.FAIL,
+            message,
+            source_file=first[0],
+            source_sheet=first[1],
+            source_row=int(first[2]) if first[2] is not None else None,
+            sku=first[3],
+            serial=serial or first[4],
+            qr=qr or first[5],
+            related_file=second[0],
+            related_row=int(second[2]) if second[2] is not None else None,
+            metadata={"occurrence_count": int(occurrence_count)},
+        )
 
-    def _record_rule_count(self, result: ValidationResult, code: str, count: int) -> None:
+    def _record_rule_count(
+        self,
+        result: ValidationResult,
+        code: str,
+        count: int,
+    ) -> None:
         result.metrics.setdefault("rule_counts", {})[code] = int(count)
 
     def _check_cancel(self) -> None:
         if self._cancel.is_set():
             raise ValidationCancelled()
 
-    def _emit(self, callback: ProgressCallback | None, stage: str, **values) -> None:
+    def _emit(
+        self,
+        callback: ProgressCallback | None,
+        stage: str,
+        **values,
+    ) -> None:
         if callback:
             callback({"stage": stage, **values})
